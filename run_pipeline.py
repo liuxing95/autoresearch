@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nasdaq_quant.config import (
     PipelineConfig, DataConfig, ModelConfig, StrategyConfig, EnsembleConfig,
+    RollingTrainConfig,
     NASDAQ100_SYMBOLS, RESULTS_DIR, MODEL_DIR, REPORT_DIR,
 )
 from nasdaq_quant.data.collector import download_stock_data, download_benchmark
@@ -219,6 +220,233 @@ def step_train(config: PipelineConfig) -> None:
 
     dt = time.time() - t0
     print(f"\nModel training complete in {dt:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Rolling Walk-Forward Training
+# ---------------------------------------------------------------------------
+
+def _select_features_by_ic(
+    train_data: pd.DataFrame,
+    label_col: str = "LABEL0",
+    n_features: int = 80,
+) -> list:
+    """Select top features by IC stability (mean IC / std IC)."""
+    feature_cols = [c for c in train_data.columns if c != label_col]
+    ic_scores = {}
+
+    # Compute daily IC for each feature
+    dates = train_data.index.get_level_values("date").unique()
+    for feat in feature_cols:
+        daily_ics = []
+        for dt in dates:
+            try:
+                day_data = train_data.xs(dt, level="date")
+                if len(day_data) < 10:
+                    continue
+                ic = np.corrcoef(day_data[feat].values, day_data[label_col].values)[0, 1]
+                if np.isfinite(ic):
+                    daily_ics.append(ic)
+            except Exception:
+                continue
+
+        if len(daily_ics) > 20:
+            mean_ic = np.mean(daily_ics)
+            std_ic = np.std(daily_ics) + 1e-12
+            icir = abs(mean_ic) / std_ic  # Use ICIR as stability measure
+            ic_scores[feat] = icir
+
+    # Sort by ICIR and take top N
+    sorted_feats = sorted(ic_scores.items(), key=lambda x: x[1], reverse=True)
+    selected = [f for f, _ in sorted_feats[:n_features]]
+
+    if len(selected) < 10:
+        # Fallback: use all features if too few selected
+        return feature_cols
+
+    return selected
+
+
+def step_rolling_train(config: PipelineConfig) -> None:
+    """
+    Rolling walk-forward training: retrain periodically with recent data.
+
+    Instead of training once on 2015-2021 and testing forever, this approach:
+    1. Divides the test period into rolling windows
+    2. For each window, trains on the most recent N years of data
+    3. Validates on a recent buffer period
+    4. Generates predictions for that window only
+    5. Concatenates all predictions for the full test period
+    """
+    print("\n" + "=" * 60)
+    print("  Step 2b: Rolling Walk-Forward Training")
+    print("=" * 60)
+
+    t0 = time.time()
+    rolling = config.rolling
+
+    # Load full dataset
+    dataset = load_dataset(DATASET_PATH)
+    feature_cols = [c for c in dataset.columns if c != config.model.label_col]
+    label_col = config.model.label_col
+
+    # Parse test period
+    test_start = pd.Timestamp(config.model.test_start)
+    test_end = pd.Timestamp(config.model.test_end)
+
+    # Generate rolling windows
+    windows = []
+    current_start = test_start
+    while current_start < test_end:
+        window_end = min(
+            current_start + pd.DateOffset(months=rolling.retrain_months),
+            test_end
+        )
+
+        # Train period: train_window_years before the test window
+        train_start = current_start - pd.DateOffset(years=rolling.train_window_years)
+        # Validation: valid_months before test window with purge gap
+        valid_end = current_start - pd.DateOffset(days=rolling.purge_days)
+        valid_start = valid_end - pd.DateOffset(months=rolling.valid_months)
+
+        windows.append({
+            "train_start": train_start.strftime("%Y-%m-%d"),
+            "train_end": (valid_start - pd.DateOffset(days=1)).strftime("%Y-%m-%d"),
+            "valid_start": valid_start.strftime("%Y-%m-%d"),
+            "valid_end": valid_end.strftime("%Y-%m-%d"),
+            "test_start": current_start.strftime("%Y-%m-%d"),
+            "test_end": window_end.strftime("%Y-%m-%d"),
+        })
+        current_start = window_end
+
+    print(f"\n  Rolling windows: {len(windows)}")
+    print(f"  Train window:    {rolling.train_window_years} years")
+    print(f"  Valid window:    {rolling.valid_months} months")
+    print(f"  Retrain every:   {rolling.retrain_months} months")
+    print(f"  Feature select:  {rolling.feature_selection} (top {rolling.n_features})")
+
+    def cross_sectional_normalize(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+        df = df.copy()
+        grouped = df.groupby(level="date")
+        for col in cols:
+            mean = grouped[col].transform("mean")
+            std = grouped[col].transform("std")
+            df[col] = (df[col] - mean) / (std + 1e-8)
+        # Clip extreme z-scores to prevent overflow in model computation
+        df[cols] = df[cols].clip(-5, 5)
+        df[cols] = df[cols].fillna(0)
+        return df
+
+    all_test_preds = []
+    all_valid_preds = []
+    window_metrics = []
+
+    for i, w in enumerate(windows):
+        print(f"\n{'─'*50}")
+        print(f"  Window {i+1}/{len(windows)}")
+        print(f"  Train: {w['train_start']} ~ {w['train_end']}")
+        print(f"  Valid: {w['valid_start']} ~ {w['valid_end']}")
+        print(f"  Test:  {w['test_start']} ~ {w['test_end']}")
+        print(f"{'─'*50}")
+
+        # Split data for this window
+        dates = dataset.index.get_level_values("date")
+        train_data = dataset[(dates >= w["train_start"]) & (dates <= w["train_end"])]
+        valid_data = dataset[(dates >= w["valid_start"]) & (dates <= w["valid_end"])]
+        test_data = dataset[(dates >= w["test_start"]) & (dates <= w["test_end"])]
+
+        if len(train_data) < 100 or len(valid_data) < 50 or len(test_data) == 0:
+            print(f"  Skipping window: insufficient data "
+                  f"(train={len(train_data)}, valid={len(valid_data)}, test={len(test_data)})")
+            continue
+
+        # Feature selection
+        used_features = feature_cols
+        if rolling.feature_selection:
+            print(f"  Selecting top {rolling.n_features} features by IC stability...")
+            used_features = _select_features_by_ic(
+                train_data, label_col, rolling.n_features
+            )
+            print(f"  Selected {len(used_features)} features")
+            # Keep only selected features + label
+            train_data = train_data[used_features + [label_col]]
+            valid_data = valid_data[used_features + [label_col]]
+            test_data = test_data[used_features + [label_col]]
+
+        # Normalize
+        train_norm = cross_sectional_normalize(train_data, used_features)
+        valid_norm = cross_sectional_normalize(valid_data, used_features)
+        test_norm = cross_sectional_normalize(test_data, used_features)
+
+        for df in [train_norm, valid_norm, test_norm]:
+            df.replace([np.inf, -np.inf], 0, inplace=True)
+            df.fillna(0, inplace=True)
+
+        # Create and train model
+        model_type = config.model.model_type
+        if model_type == "lightgbm":
+            model = create_model(
+                "lightgbm",
+                n_estimators=config.model.lgb.n_estimators,
+                learning_rate=config.model.lgb.learning_rate,
+                max_depth=config.model.lgb.max_depth,
+                num_leaves=config.model.lgb.num_leaves,
+                subsample=config.model.lgb.subsample,
+                colsample_bytree=config.model.lgb.colsample_bytree,
+                lambda_l1=config.model.lgb.lambda_l1,
+                lambda_l2=config.model.lgb.lambda_l2,
+                early_stopping_rounds=config.model.lgb.early_stopping_rounds,
+                num_threads=config.model.lgb.num_threads,
+            )
+        elif model_type == "linear":
+            model = create_model("linear")
+        else:
+            model = create_model(model_type, d_feat=len(used_features))
+
+        metrics = model.train(train_norm, valid_norm, label_col=label_col)
+        window_metrics.append(metrics)
+
+        # Generate predictions
+        test_preds = model.predict(test_norm, label_col=label_col)
+        valid_preds = model.predict(valid_norm, label_col=label_col)
+        all_test_preds.append(test_preds)
+        all_valid_preds.append(valid_preds)
+
+        print(f"  Window IC: train={metrics.get('train_ic', 0):.4f}, "
+              f"valid={metrics.get('valid_ic', 0):.4f}")
+
+    # Concatenate all predictions
+    if all_test_preds:
+        combined_test = pd.concat(all_test_preds)
+        # Remove duplicates (overlapping dates between windows)
+        combined_test = combined_test[~combined_test.index.duplicated(keep='last')]
+
+        combined_valid = pd.concat(all_valid_preds) if all_valid_preds else pd.Series(dtype=float)
+        if not combined_valid.empty:
+            combined_valid = combined_valid[~combined_valid.index.duplicated(keep='last')]
+
+        all_preds = pd.concat([combined_valid, combined_test])
+        all_preds = all_preds[~all_preds.index.duplicated(keep='last')]
+        all_preds.to_frame("pred_score").to_parquet(PRED_PATH)
+
+        # Summary
+        avg_train_ic = np.mean([m.get("train_ic", 0) for m in window_metrics])
+        avg_valid_ic = np.mean([m.get("valid_ic", 0) for m in window_metrics])
+        print(f"\n{'='*50}")
+        print(f"  Rolling training summary:")
+        print(f"  Windows trained: {len(window_metrics)}")
+        print(f"  Avg train IC:    {avg_train_ic:.4f}")
+        print(f"  Avg valid IC:    {avg_valid_ic:.4f}")
+        print(f"  Total preds:     {len(combined_test)}")
+
+        # Log
+        _log_result(config, f"rolling_{config.model.model_type}",
+                    {"valid_ic": avg_valid_ic, "valid_mse": 0})
+    else:
+        print("\nERROR: No predictions generated. Check data availability.")
+
+    dt = time.time() - t0
+    print(f"\nRolling training complete in {dt:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +757,7 @@ def main():
     parser = argparse.ArgumentParser(description="NASDAQ Quantitative Trading Pipeline")
     parser.add_argument(
         "--step", type=str, default="all",
-        choices=["all", "data", "train", "backtest", "analysis", "ensemble"],
+        choices=["all", "data", "train", "backtest", "analysis", "ensemble", "rolling_train"],
         help="Pipeline step to run",
     )
     parser.add_argument(
@@ -550,11 +778,11 @@ def main():
         help="Comma-separated list of symbols (default: NASDAQ 100)",
     )
     parser.add_argument(
-        "--test-start", type=str, default="2023-01-01",
+        "--test-start", type=str, default="2021-01-01",
         help="Test period start date",
     )
     parser.add_argument(
-        "--test-end", type=str, default="2024-12-31",
+        "--test-end", type=str, default="2022-12-31",
         help="Test period end date",
     )
     # LightGBM hyperparams
@@ -581,6 +809,23 @@ def main():
     parser.add_argument("--ensemble-method", type=str, default="ic_weighted",
                         choices=["equal", "ic_weighted", "rank_average"],
                         help="Ensemble weighting method")
+    # Rolling walk-forward training
+    parser.add_argument("--rolling", action="store_true", default=False,
+                        help="Enable rolling walk-forward training")
+    parser.add_argument("--train-window", type=int, default=3,
+                        help="Rolling training window in years (default: 3)")
+    parser.add_argument("--retrain-freq", type=int, default=6,
+                        help="Retrain frequency in months (default: 6)")
+    parser.add_argument("--feature-select", action="store_true", default=False,
+                        help="Enable IC-based feature selection")
+    parser.add_argument("--n-features", type=int, default=80,
+                        help="Number of features to select (default: 80)")
+    parser.add_argument("--label-days", type=int, default=2,
+                        help="Forward return horizon in days (default: 2)")
+    parser.add_argument("--subsample", type=float, default=None,
+                        help="LightGBM subsample ratio")
+    parser.add_argument("--colsample-bytree", type=float, default=None,
+                        help="LightGBM column sample ratio")
 
     args = parser.parse_args()
 
@@ -611,17 +856,34 @@ def main():
     config.ensemble.enable = args.ensemble
     config.ensemble.method = args.ensemble_method
 
+    # Rolling training config
+    config.rolling.enable = args.rolling
+    config.rolling.train_window_years = args.train_window
+    config.rolling.retrain_months = args.retrain_freq
+    config.rolling.feature_selection = args.feature_select
+    config.rolling.n_features = args.n_features
+    config.rolling.label_days = args.label_days
+
+    # LightGBM subsample and colsample overrides
+    if args.subsample is not None:
+        config.model.lgb.subsample = args.subsample
+    if args.colsample_bytree is not None:
+        config.model.lgb.colsample_bytree = args.colsample_bytree
+
     if args.symbols:
         config.data.symbols = [s.strip() for s in args.symbols.split(",")]
 
     print("=" * 60)
     print("  NASDAQ Quantitative Trading System")
     print("=" * 60)
-    print(f"  Model:      {config.model.model_type}{' (ensemble)' if config.ensemble.enable else ''}")
+    print(f"  Model:      {config.model.model_type}{' (ensemble)' if config.ensemble.enable else ''}{' (rolling)' if config.rolling.enable else ''}")
     print(f"  TopK:       {config.strategy.topk}")
     print(f"  Rebalance:  {config.strategy.rebalance_freq}")
     print(f"  Stop Loss:  {config.strategy.stop_loss*100:.0f}%")
     print(f"  DD Limit:   {config.strategy.max_drawdown_limit*100:.0f}%")
+    if config.rolling.enable:
+        print(f"  Train Win:  {config.rolling.train_window_years}yr, retrain every {config.rolling.retrain_months}mo")
+        print(f"  Feat Sel:   {config.rolling.feature_selection} (top {config.rolling.n_features})")
     print(f"  Symbols:    {len(config.data.symbols)} stocks")
     print(f"  Train:      {config.model.train_start} ~ {config.model.train_end}")
     print(f"  Valid:      {config.model.valid_start} ~ {config.model.valid_end}")
@@ -634,7 +896,9 @@ def main():
     if args.step in ("all", "data"):
         step_data(config)
 
-    if args.step in ("all", "train"):
+    if args.step == "rolling_train" or (args.step == "all" and config.rolling.enable):
+        step_rolling_train(config)
+    elif args.step in ("all", "train"):
         step_train(config)
 
     if args.step == "ensemble" or (args.step == "all" and config.ensemble.enable):

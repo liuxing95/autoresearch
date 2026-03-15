@@ -23,3 +23,5 @@ dev/
 results.tsv
 
 quant_results
+
+.DS_Store

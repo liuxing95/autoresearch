@@ -41,8 +41,8 @@ NASDAQ100_SYMBOLS = [
 @dataclass
 class DataConfig:
     symbols: List[str] = field(default_factory=lambda: NASDAQ100_SYMBOLS)
-    start_date: str = "2015-01-01"
-    end_date: str = "2024-12-31"
+    start_date: str = "2013-01-01"
+    end_date: str = "2022-12-31"
     data_dir: str = QLIB_DATA_DIR
     freq: str = "day"
 
@@ -86,12 +86,12 @@ class ModelConfig:
     lstm: LSTMConfig = field(default_factory=LSTMConfig)
     label_col: str = "LABEL0"
     # Time splits
-    train_start: str = "2015-01-01"
-    train_end: str = "2021-12-31"
-    valid_start: str = "2022-01-01"
-    valid_end: str = "2022-12-31"
-    test_start: str = "2023-01-01"
-    test_end: str = "2024-12-31"
+    train_start: str = "2013-01-01"
+    train_end: str = "2019-12-31"
+    valid_start: str = "2020-01-01"
+    valid_end: str = "2020-12-31"
+    test_start: str = "2021-01-01"
+    test_end: str = "2022-12-31"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +111,22 @@ class StrategyConfig:
     max_weight: float = 0.10  # max 10% per stock
     stop_loss: float = -0.08  # per-stock stop loss threshold (-8%)
     max_drawdown_limit: float = -0.20  # portfolio drawdown circuit breaker (-20%)
+
+
+# ---------------------------------------------------------------------------
+# Rolling training configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RollingTrainConfig:
+    enable: bool = False
+    train_window_years: int = 3       # Years of training data per window
+    valid_months: int = 6             # Months of validation data
+    retrain_months: int = 6           # Retrain every N months
+    feature_selection: bool = True    # IC-based feature filtering
+    n_features: int = 80              # Top N features by IC stability
+    label_days: int = 2               # Forward return horizon (1, 2, 5, 10)
+    purge_days: int = 5               # Gap between train and valid (prevent leakage)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +150,7 @@ class PipelineConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    rolling: RollingTrainConfig = field(default_factory=RollingTrainConfig)
     results_dir: str = RESULTS_DIR
     model_dir: str = MODEL_DIR
     report_dir: str = REPORT_DIR
