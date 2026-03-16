@@ -86,6 +86,18 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 - [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
 
+## Quantitative Trading with AI (量化交易延伸)
+
+If you are interested in applying the autoresearch autonomous-iteration paradigm to **quantitative stock trading** by combining it with [virattt/ai-hedge-fund](https://github.com/virattt/ai-hedge-fund), see the following guides in `docs/`:
+
+| Document | Description |
+|---|---|
+| [`docs/quant-trading-prd.md`](docs/quant-trading-prd.md) | Product Requirements Document — full iterative roadmap, user stories, milestones |
+| [`docs/quant-trading-technical-plan.md`](docs/quant-trading-technical-plan.md) | Technical architecture — how autoresearch + ai-hedge-fund integrate, code structure, key module designs |
+| [`docs/quant-trading-tutorial.md`](docs/quant-trading-tutorial.md) | Step-by-step tutorial — from environment setup to autonomous strategy iteration to paper trading |
+
+The core idea: replace `train.py` with `strategy_template.py`, replace `val_bpb` with `Sharpe Ratio`, and let the same autonomous agent loop improve your trading strategy overnight.
+
 ## License
 
 MIT
